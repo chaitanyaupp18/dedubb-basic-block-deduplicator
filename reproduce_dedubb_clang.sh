@@ -87,9 +87,12 @@ ninja clang
 OPTIMIZED_DEDUBB_CC_LD_CMAKE_FLAGS=(
   "-DCMAKE_C_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map"
   "-DCMAKE_CXX_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map"
-  "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map -Wl,-mllvm,-dedubb-directives=${PATH_TO_PROFILES}/dedubb_directives.txt"
-  "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map -Wl,-mllvm,-dedubb-directives=${PATH_TO_PROFILES}/dedubb_directives.txt"
-  "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map -Wl,-mllvm,-dedubb-directives=${PATH_TO_PROFILES}/dedubb_directives.txt" )
+  "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map"
+  "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map"
+  "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map" )
+
+# Patch clang's CMakeLists.txt to apply DeduBB directives ONLY to the clang executable link
+sed -i "s|target_link_libraries(clang PRIVATE.*|target_link_libraries(clang PRIVATE \"-Wl,-mllvm,-dedubb-directives=${PATH_TO_PROFILES}/dedubb_directives.txt\")|" ${PATH_TO_LLVM_SOURCES}/llvm-project/clang/tools/driver/CMakeLists.txt
 
 PATH_TO_OPTIMIZED_DEDUBB_BUILD=${BASE_DIR}/optimized_dedubb_build
 mkdir -p ${PATH_TO_OPTIMIZED_DEDUBB_BUILD} && cd ${PATH_TO_OPTIMIZED_DEDUBB_BUILD}
