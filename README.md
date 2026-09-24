@@ -47,10 +47,10 @@ int main(int argc, char** argv) {
 Run the following commands from your `tail-call` root directory.
 
 ### Step 1: Compile with BBAddrMap
-First, compile the two files into a single binary, instructing Clang to emit the `BBAddrMap` sections so Propeller can read the block boundaries. We compile without ThinLTO here to ensure the `.llvm_bb_addr_map` section is flawlessly emitted.
+First, compile the two files into a single binary. We compile with ThinLTO (`-flto=thin`) and pass `-Wl,--lto-basic-block-address-map` to ensure the LLD linker correctly preserves the map.
 
 ```bash
-./llvm-project/trunk_build/bin/clang++ -g -O2 -fbasic-block-address-map test1.cpp test2.cpp -o test_no_lto_labels
+./llvm-project/trunk_build/bin/clang++ -g -O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld -Wl,--lto-basic-block-address-map test1.cpp test2.cpp -o test_lto_labels
 ```
 
 ### Step 2: Generate Propeller Directives
@@ -69,8 +69,9 @@ Re-compile the source files, this time passing the generated directives file to 
 > You must include `-fbasic-block-address-map` here as well so the blocks are assigned the `BBID`s that the `DeduBB` pass expects to match against!
 
 ```bash
-./llvm-project/trunk_build/bin/clang++ -g -O2 -fbasic-block-address-map \
-    -mllvm -dedubb-directives=dedubb_directives.txt \
+./llvm-project/trunk_build/bin/clang++ -g -O2 -flto=thin -fbasic-block-address-map \
+    -fuse-ld=lld -Wl,--lto-basic-block-address-map \
+    -Wl,-mllvm,-dedubb-directives=dedubb_directives.txt \
     test1.cpp test2.cpp -o test_deduplicated
 ```
 
