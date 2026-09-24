@@ -32,6 +32,7 @@ Our `DeduBB` CodeGen pass identifies the duplication using Propeller. It promote
 
 ```assembly
 0000000000001780 <_Z17identical_block_1i>:
+0000000000001780 <DeduBB.master.0>:  <-- (Internal alias visible via nm)
     1780:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
     1783:       8d 04 87                lea    (%rdi,%rax,4),%eax
     1786:       83 c0 2a                add    $0x2a,%eax
