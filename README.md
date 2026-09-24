@@ -2,49 +2,53 @@
 
 This document provides a minimal, reproducible test case to verify that the `DeduBB` CodeGen pass and Propeller successfully identify and fold identical basic blocks across different modules.
 
-## 1. The Test Case
+## 1. The Test Case (Before & After Assembly)
 
-The test case consists of two separate source files. Each file contains an identical function that performs some arbitrary math. 
-By avoiding inline assembly, we ensure that LLVM can naturally see the `ret` instruction at the end of the block and correctly tag it with `has_return()` in the `BBAddrMap`. Furthermore, the arbitrary math ensures the block size exceeds Propeller's minimum patch size (5 bytes).
+Instead of looking at the C++ source, let's look directly at the compiled assembly before and after our cross-module tail-call deduplication pass is applied.
 
-**`test1.cpp`**
-```cpp
-#include <stdio.h>
+**Before Deduplication (Baseline):**
+We have two identical blocks of logic residing in completely separate translation units (`test1.cpp` and `test2.cpp`). Because they are compiled separately, the standard compiler cannot deduplicate them.
 
-__attribute__((noinline)) int identical_block_1(int x) {
-    int y = x * 13;
-    y += 42;
-    y ^= 0xdeadbeef;
-    y -= 100;
-    return y;
-}
+```assembly
+0000000000001140 <_Z17identical_block_1i>:
+    1140:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
+    1143:       8d 04 87                lea    (%rdi,%rax,4),%eax
+    1146:       83 c0 2a                add    $0x2a,%eax
+    1149:       35 ef be ad de          xor    $0xdeadbeef,%eax
+    114e:       83 c0 9c                add    $0xffffff9c,%eax
+    1151:       c3                      ret
+
+0000000000001160 <_Z17identical_block_2i>:
+    1160:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
+    1163:       8d 04 87                lea    (%rdi,%rax,4),%eax
+    1166:       83 c0 2a                add    $0x2a,%eax
+    1169:       35 ef be ad de          xor    $0xdeadbeef,%eax
+    116e:       83 c0 9c                add    $0xffffff9c,%eax
+    1171:       c3                      ret
 ```
 
-**`test2.cpp`**
-```cpp
-#include <stdio.h>
+**After DeduBB Cross-Module Deduplication:**
+Our `DeduBB` CodeGen pass identifies the duplication using Propeller. It promotes the first block to a global `DeduBB.master.0` symbol. The second block is wiped out and replaced with a jump to that global symbol, which is seamlessly resolved by the ThinLTO linker!
 
-extern int identical_block_1(int x);
+```assembly
+0000000000001140 <_Z17identical_block_1i>:
+0000000000001140 <DeduBB.master.0>:
+    1140:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
+    1143:       8d 04 87                lea    (%rdi,%rax,4),%eax
+    1146:       83 c0 2a                add    $0x2a,%eax
+    1149:       35 ef be ad de          xor    $0xdeadbeef,%eax
+    114e:       83 c0 9c                add    $0xffffff9c,%eax
+    1151:       c3                      ret
 
-__attribute__((noinline)) int identical_block_2(int x) {
-    int y = x * 13;
-    y += 42;
-    y ^= 0xdeadbeef;
-    y -= 100;
-    return y;
-}
-
-int main(int argc, char** argv) {
-    printf("%d %d\n", identical_block_1(argc), identical_block_2(argc));
-    return 0;
-}
+0000000000001160 <_Z17identical_block_2i>:
+    1160:       e9 db ff ff ff          jmp    1140 <DeduBB.master.0>
 ```
 
 ---
 
 ## 2. Step-by-Step Commands
 
-Run the following commands from your `tail-call` root directory.
+Run the following commands from your `tail-call` root directory to reproduce the results above.
 
 ### Step 1: Compile with BBAddrMap
 First, compile the two files into a single binary. We compile with ThinLTO (`-flto=thin`) and pass `-Wl,--lto-basic-block-address-map` to ensure the LLD linker correctly preserves the map.
@@ -76,25 +80,8 @@ Re-compile the source files, this time passing the generated directives file to 
 ```
 
 ### Step 4: Verify the Fold
-Finally, disassemble the resulting binary to verify that `identical_block_2` in the second module was replaced by a cross-module jump to `identical_block_1`.
+Finally, disassemble the resulting binary to verify the fold matches the "After" assembly block above!
 
 ```bash
 objdump -d test_deduplicated | grep -A 15 "<_Z17identical_block_"
-```
-
-**Expected Output:**
-```assembly
-0000000000001140 <_Z17identical_block_1i>:
-    1140:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
-    1143:       8d 04 87                lea    (%rdi,%rax,4),%eax
-    1146:       83 c0 2a                add    $0x2a,%eax
-    1149:       35 ef be ad de          xor    $0xdeadbeef,%eax
-    114e:       83 c0 9c                add    $0xffffff9c,%eax
-    1151:       c3                      ret
-    1152:       66 2e 0f 1f 84 00 00    cs nopw 0x0(%rax,%rax,1)
-    1159:       00 00 00 
-    115c:       0f 1f 40 00             nopl   0x0(%rax)
-
-0000000000001160 <_Z17identical_block_2i>:
-    1160:       e9 db ff ff ff          jmp    1140 <_Z17identical_block_1i>
 ```
