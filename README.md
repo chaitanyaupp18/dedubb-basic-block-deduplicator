@@ -31,7 +31,6 @@ We have two identical blocks of logic residing in completely separate translatio
 Our `DeduBB` CodeGen pass identifies the duplication using Propeller. It promotes the first block to a global `DeduBB.master.0` symbol. The second block is wiped out and replaced with a jump to that global symbol, which is seamlessly resolved by the ThinLTO linker!
 
 ```assembly
-0000000000001140 <_Z17identical_block_1i>:
 0000000000001140 <DeduBB.master.0>:
     1140:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
     1143:       8d 04 87                lea    (%rdi,%rax,4),%eax
