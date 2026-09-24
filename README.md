@@ -10,37 +10,37 @@ Instead of looking at the C++ source, let's look directly at the compiled assemb
 We have two identical blocks of logic residing in completely separate translation units (`test1.cpp` and `test2.cpp`). Because they are compiled separately, the standard compiler cannot deduplicate them.
 
 ```assembly
-0000000000001140 <_Z17identical_block_1i>:
-    1140:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
-    1143:       8d 04 87                lea    (%rdi,%rax,4),%eax
-    1146:       83 c0 2a                add    $0x2a,%eax
-    1149:       35 ef be ad de          xor    $0xdeadbeef,%eax
-    114e:       83 c0 9c                add    $0xffffff9c,%eax
-    1151:       c3                      ret
+0000000000001780 <_Z17identical_block_1i>:
+    1780:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
+    1783:       8d 04 87                lea    (%rdi,%rax,4),%eax
+    1786:       83 c0 2a                add    $0x2a,%eax
+    1789:       35 ef be ad de          xor    $0xdeadbeef,%eax
+    178e:       83 c0 9c                add    $0xffffff9c,%eax
+    1791:       c3                      ret
 
-0000000000001160 <_Z17identical_block_2i>:
-    1160:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
-    1163:       8d 04 87                lea    (%rdi,%rax,4),%eax
-    1166:       83 c0 2a                add    $0x2a,%eax
-    1169:       35 ef be ad de          xor    $0xdeadbeef,%eax
-    116e:       83 c0 9c                add    $0xffffff9c,%eax
-    1171:       c3                      ret
+00000000000017a0 <_Z17identical_block_2i>:
+    17a0:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
+    17a3:       8d 04 87                lea    (%rdi,%rax,4),%eax
+    17a6:       83 c0 2a                add    $0x2a,%eax
+    17a9:       35 ef be ad de          xor    $0xdeadbeef,%eax
+    17ae:       83 c0 9c                add    $0xffffff9c,%eax
+    17b1:       c3                      ret
 ```
 
 **After DeduBB Cross-Module Deduplication:**
-Our `DeduBB` CodeGen pass identifies the duplication using Propeller. It promotes the first block to a global `DeduBB.master.0` symbol. The second block is wiped out and replaced with a jump to that global symbol, which is seamlessly resolved by the ThinLTO linker!
+Our `DeduBB` CodeGen pass identifies the duplication using Propeller. It promotes the first block to a global `DeduBB.master` symbol. The second block is wiped out and replaced with a jump to that global symbol. When the ThinLTO linker resolves the jump, it seamlessly redirects it to the address of `identical_block_1`!
 
 ```assembly
-0000000000001140 <DeduBB.master.0>:
-    1140:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
-    1143:       8d 04 87                lea    (%rdi,%rax,4),%eax
-    1146:       83 c0 2a                add    $0x2a,%eax
-    1149:       35 ef be ad de          xor    $0xdeadbeef,%eax
-    114e:       83 c0 9c                add    $0xffffff9c,%eax
-    1151:       c3                      ret
+0000000000001780 <_Z17identical_block_1i>:
+    1780:       8d 04 7f                lea    (%rdi,%rdi,2),%eax
+    1783:       8d 04 87                lea    (%rdi,%rax,4),%eax
+    1786:       83 c0 2a                add    $0x2a,%eax
+    1789:       35 ef be ad de          xor    $0xdeadbeef,%eax
+    178e:       83 c0 9c                add    $0xffffff9c,%eax
+    1791:       c3                      ret
 
-0000000000001160 <_Z17identical_block_2i>:
-    1160:       e9 db ff ff ff          jmp    1140 <DeduBB.master.0>
+0000000000001798 <_Z17identical_block_2i>:
+    1798:       e9 e3 ff ff ff          jmp    1780 <_Z17identical_block_1i>
 ```
 
 ---
