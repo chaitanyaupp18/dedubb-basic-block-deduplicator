@@ -1,0 +1,952 @@
+diff --git a/propeller/BUILD b/propeller/BUILD
+index 1f64add..be07a9a 100644
+--- a/propeller/BUILD
++++ b/propeller/BUILD
+@@ -991,6 +991,41 @@ cc_library(
+     ],
+ )
+ 
++cc_library(
++    name = "tail_call_dedupper",
++    srcs = ["tail_call_dedupper.cc"],
++    hdrs = ["tail_call_dedupper.h"],
++)
++
++cc_test(
++    name = "tail_call_dedupper_test",
++    srcs = ["tail_call_dedupper_test.cc"],
++    deps = [
++        ":tail_call_dedupper",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
++cc_library(
++    name = "tail_call_profile_writer",
++    srcs = ["tail_call_profile_writer.cc"],
++    hdrs = ["tail_call_profile_writer.h"],
++    deps = [
++        ":bb_addr_map",
++        ":bb_addr_map_cc_proto",
++        ":binary_content",
++        ":propeller_options_cc_proto",
++        ":status_macros",
++        ":tail_call_dedupper",
++        "@abseil-cpp//absl/log",
++        "@abseil-cpp//absl/status",
++        "@abseil-cpp//absl/status:statusor",
++        "@abseil-cpp//absl/strings:str_format",
++        "@llvm-project//llvm:Object",
++        "@llvm-project//llvm:TargetParser",
++    ],
++)
++
+ cc_library(
+     name = "profile_generator",
+     srcs = ["profile_generator.cc"],
+@@ -1013,6 +1048,7 @@ cc_library(
+         ":propeller_options_cc_proto",
+         ":proto_branch_frequencies_aggregator",
+         ":status_macros",
++        ":tail_call_profile_writer",
+         "@abseil-cpp//absl/algorithm:container",
+         "@abseil-cpp//absl/container:flat_hash_set",
+         "@abseil-cpp//absl/log",
+@@ -1042,6 +1078,7 @@ cc_binary(
+     deps = [
+         ":profile_generator",
+         ":propeller_options_cc_proto",
++        ":tail_call_profile_writer",
+         ":text_proto_flag",
+         "@abseil-cpp//absl/container:flat_hash_map",
+         "@abseil-cpp//absl/flags:flag",
+diff --git a/propeller/CMakeLists.txt b/propeller/CMakeLists.txt
+index a7a055a..818b1b8 100644
+--- a/propeller/CMakeLists.txt
++++ b/propeller/CMakeLists.txt
+@@ -54,6 +54,8 @@ add_library(propeller_lib OBJECT
+   proto_branch_frequencies_aggregator.cc
+   resolve_mmap_name.cc
+   spe_tid_pid_provider.cc
++  tail_call_dedupper.cc
++  tail_call_profile_writer.cc
+   # keep-sorted end
+ )
+ target_link_libraries(propeller_lib
+@@ -124,6 +126,7 @@ propeller_generate_tests(
+     spe_tid_pid_provider_test.cc
+     status_macros_test.cc
+     status_testing_macros_test.cc
++    tail_call_dedupper_test.cc
+     # keep-sorted end
+   DEPS
+     # keep-sorted start
+diff --git a/propeller/generate_propeller_profiles.cc b/propeller/generate_propeller_profiles.cc
+index 34c7b30..3ddde29 100644
+--- a/propeller/generate_propeller_profiles.cc
++++ b/propeller/generate_propeller_profiles.cc
+@@ -42,6 +42,7 @@
+ #include "absl/strings/string_view.h"
+ #include "propeller/profile_generator.h"
+ #include "propeller/propeller_options.pb.h"
++#include "propeller/tail_call_profile_writer.h"
+ #include "propeller/text_proto_flag.h"
+ 
+ namespace {
+@@ -65,6 +66,16 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
+           "\"PERF_SPE\", \"FREQUENCIES_PROTO\").");
+ ABSL_FLAG(std::string, cc_profile, "", "Output cc profile");
+ ABSL_FLAG(std::string, ld_profile, "", "Output ld profile");
++ABSL_FLAG(std::string, tail_call_profile, "",
++          "Output DeduBB tail-call deduplication directive file (the "
++          "`m`/`f`/`bbm`/`bbf` directives). Scans the binary for byte-identical "
++          "basic blocks ending in a tail call or return. Does not require a "
++          "perf profile.");
++ABSL_FLAG(bool, tail_call_dedup_cold_only, false,
++          "Restrict tail-call deduplication to cold basic blocks (zero "
++          "post-link frequency) to preserve hot-path performance.");
++ABSL_FLAG(bool, tail_call_dedup_intra_module_only, false,
++          "Restrict tail-call deduplication to blocks within the same module.");
+ ABSL_FLAG(propeller::TextProtoFlag<propeller::PropellerOptions>,
+           propeller_options, {},
+           "Override for propeller options (debug only).");
+@@ -122,6 +133,11 @@ int main(int argc, char* argv[]) {
+   options.set_binary_name(absl::GetFlag(FLAGS_binary));
+   options.set_cluster_out_name(absl::GetFlag(FLAGS_cc_profile));
+   options.set_symbol_order_out_name(absl::GetFlag(FLAGS_ld_profile));
++  options.set_tail_call_profile_out_name(absl::GetFlag(FLAGS_tail_call_profile));
++  options.set_tail_call_dedup_cold_only(
++      absl::GetFlag(FLAGS_tail_call_dedup_cold_only));
++  options.set_tail_call_dedup_intra_module_only(
++      absl::GetFlag(FLAGS_tail_call_dedup_intra_module_only));
+ 
+   for (const std::string& profile : absl::GetFlag(FLAGS_profile)) {
+     InputProfile* input_profile = options.add_input_profiles();
+@@ -130,5 +146,14 @@ int main(int argc, char* argv[]) {
+         ToProtoProfileType(absl::GetFlag(FLAGS_profile_type)));
+   }
+ 
++  // Tail-call deduplication is a static analysis of the binary and needs no
++  // perf profile. When the user only asks for the DeduBB directive file (no
++  // input profiles), emit it directly without running the profile pipeline.
++  if (!options.tail_call_profile_out_name().empty() &&
++      options.input_profiles().empty()) {
++    QCHECK_OK(propeller::WriteTailCallDedupProfile(options));
++    return 0;
++  }
++
+   QCHECK_OK(GeneratePropellerProfiles(options));
+ }
+diff --git a/propeller/mini_disassembler.cc b/propeller/mini_disassembler.cc
+index 5ba1b7c..bf773ca 100644
+--- a/propeller/mini_disassembler.cc
++++ b/propeller/mini_disassembler.cc
+@@ -90,8 +90,8 @@ MiniDisassembler::Create(const llvm::object::ObjectFile* object_file) {
+   }
+ 
+   disassembler->ctx_ = std::make_unique<llvm::MCContext>(
+-      triple, *disassembler->asm_info_, *disassembler->mri_,
+-      *disassembler->sti_);
++      triple, *disassembler->asm_info_, disassembler->mri_.get(),
++      disassembler->sti_.get());
+   disassembler->disasm_ = absl::WrapUnique(
+       target->createMCDisassembler(*disassembler->sti_, *disassembler->ctx_));
+   if (disassembler->disasm_ == nullptr)
+diff --git a/propeller/profile_generator.cc b/propeller/profile_generator.cc
+index 61f6643..89e9ea1 100644
+--- a/propeller/profile_generator.cc
++++ b/propeller/profile_generator.cc
+@@ -45,6 +45,7 @@
+ #include "propeller/propeller_options.pb.h"
+ #include "propeller/proto_branch_frequencies_aggregator.h"
+ #include "propeller/status_macros.h"  // Included for macros.
++#include "propeller/tail_call_profile_writer.h"
+ 
+ namespace propeller {
+ namespace {
+@@ -168,6 +169,9 @@ absl::Status GeneratePropellerProfiles(
+   RETURN_IF_ERROR(PropellerProfileWriter(opts).Write(profile));
+   LOG(INFO) << profile.stats.DebugString();
+ 
++  // Also emit DeduBB tail-call deduplication directives when requested.
++  RETURN_IF_ERROR(WriteTailCallDedupProfile(opts));
++
+   return absl::OkStatus();
+ }
+ }  // namespace
+diff --git a/propeller/propeller_options.proto b/propeller/propeller_options.proto
+index 5be1683..03c13ba 100644
+--- a/propeller/propeller_options.proto
++++ b/propeller/propeller_options.proto
+@@ -33,7 +33,7 @@ message InputProfile {
+   ProfileType type = 2;
+ }
+ 
+-// Next Available: 19.
++// Next Available: 21.
+ message PropellerOptions {
+   // binary file name.
+   string binary_name = 1;
+@@ -92,6 +92,21 @@ message PropellerOptions {
+ 
+   // Write the basic block hash in the cluster file.
+   bool write_bb_hash = 18 [default = false];
++
++  // Output file for DeduBB tail-call deduplication directives (the `m`/`f`/
++  // `bbm`/`bbf` directive file). When set, Propeller scans the binary for
++  // byte-identical basic blocks that end in a tail call or return and emits the
++  // directives consumed by the LLVM CodeGen DeduBB pass. Empty disables it.
++  string tail_call_profile_out_name = 19;
++
++  // When true, restrict tail-call deduplication to cold basic blocks (those with
++  // a zero post-link frequency), preserving hot-path performance as in the
++  // DeduBB paper. Requires a profile to be useful; with no profile every block
++  // is considered cold. Defaults to false (deduplicate all tail/return blocks).
++  bool tail_call_dedup_cold_only = 20 [default = false];
++
++  // When true, restrict tail-call deduplication to blocks within the same module.
++  bool tail_call_dedup_intra_module_only = 21 [default = false];
+ }
+ 
+ // Next Available: 15.
+diff --git a/propeller/tail_call_dedupper.cc b/propeller/tail_call_dedupper.cc
+new file mode 100644
+index 0000000..69abcb7
+--- /dev/null
++++ b/propeller/tail_call_dedupper.cc
+@@ -0,0 +1,200 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "propeller/tail_call_dedupper.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <tuple>
++#include <unordered_map>
++#include <vector>
++
++namespace propeller {
++
++uint64_t Fnv1aHash(const uint8_t* data, size_t size) {
++  // 64-bit FNV-1a constants.
++  constexpr uint64_t kOffsetBasis = 0xcbf29ce484222325ULL;
++  constexpr uint64_t kPrime = 0x100000001b3ULL;
++  uint64_t hash = kOffsetBasis;
++  for (size_t i = 0; i < size; ++i) {
++    hash ^= static_cast<uint64_t>(data[i]);
++    hash *= kPrime;
++  }
++  return hash;
++}
++
++uint64_t Fnv1aHash(const std::vector<uint8_t>& bytes) {
++  return Fnv1aHash(bytes.data(), bytes.size());
++}
++
++namespace {
++
++// A set of blocks (referenced by index into the caller's `blocks` vector) whose
++// machine bytes are all identical. The first element (lowest address) is the
++// master copy.
++struct IdenticalGroup {
++  std::vector<int> members;  // indices into `blocks`, in ascending address order
++};
++
++// Orders blocks deterministically; the hottest is promoted to the master.
++// We prioritize functions that do not have a ThinLTO ".llvm." suffix,
++// so that the master block is placed in a stable symbol name.
++bool BlockOrderLess(const TailCallBlock& a, const TailCallBlock& b) {
++  if (a.frequency != b.frequency) {
++    return a.frequency > b.frequency;
++  }
++  bool a_has_llvm = a.function_name.find(".llvm.") != std::string::npos;
++  bool b_has_llvm = b.function_name.find(".llvm.") != std::string::npos;
++  if (a_has_llvm != b_has_llvm) {
++    return !a_has_llvm;  // prefer a if it does NOT have .llvm.
++  }
++  return std::tie(a.address, a.module_name, a.function_name, a.bb_id) <
++         std::tie(b.address, b.module_name, b.function_name, b.bb_id);
++}
++
++// Orders directives for output: grouped by module, then function, then bb id.
++bool DirectiveOrderLess(const Directive& a, const Directive& b) {
++  return std::tie(a.module_name, a.function_name, a.bb_id) <
++         std::tie(b.module_name, b.function_name, b.bb_id);
++}
++
++}  // namespace
++
++TailCallDedupResult DeduplicateTailCallBlocks(
++    const std::vector<TailCallBlock>& blocks,
++    const TailCallDedupOptions& options) {
++  TailCallDedupResult result;
++
++  // Process blocks in a deterministic order so master selection (first in a
++  // group) and master-id assignment are reproducible.
++  std::vector<int> order(blocks.size());
++  for (int i = 0; i < static_cast<int>(blocks.size()); ++i) order[i] = i;
++  std::sort(order.begin(), order.end(), [&](int x, int y) {
++    return BlockOrderLess(blocks[x], blocks[y]);
++  });
++
++  // Bucket by FNV-1a hash, then split each bucket into byte-identical groups.
++  // The hash is only a fast filter; group membership is decided by an exact
++  // byte-by-byte comparison, which rules out hash collisions.
++  std::unordered_map<uint64_t, std::vector<IdenticalGroup>> buckets;
++  std::vector<IdenticalGroup*> all_groups;  // stable pointers into `buckets`
++  for (int idx : order) {
++    const TailCallBlock& block = blocks[idx];
++    if (block.bytes.empty()) continue;
++    uint64_t hash = Fnv1aHash(block.bytes);
++    std::vector<IdenticalGroup>& bucket = buckets[hash];
++
++    IdenticalGroup* match = nullptr;
++    for (IdenticalGroup& group : bucket) {
++      // Verify against the group's representative (master) byte-for-byte.
++      if (blocks[group.members.front()].bytes == block.bytes) {
++        if (!options.intra_module_only ||
++            blocks[group.members.front()].module_name == block.module_name) {
++          match = &group;
++          break;
++        }
++      }
++    }
++    if (match == nullptr) {
++      bucket.push_back(IdenticalGroup{{idx}});
++      // NOTE: pointers into a vector are invalidated on growth; we collect the
++      // final pointers in a second pass below instead of here.
++    } else {
++      match->members.push_back(idx);
++    }
++  }
++
++  // Collect groups that are worth folding into a flat, deterministically ordered
++  // list (sorted by the master block) so master ids are stable.
++  for (auto& [hash, bucket] : buckets) {
++    for (IdenticalGroup& group : bucket) {
++      const int count = static_cast<int>(group.members.size());
++      if (count < options.min_occurrences) continue;
++      const int size = static_cast<int>(blocks[group.members.front()].bytes.size());
++      // Size benefit of folding `count` identical blocks of `size` bytes each by
++      // keeping one master in place and replacing the other `count - 1` copies
++      // with a `patch_size`-byte jump.
++      const int64_t benefit =
++          static_cast<int64_t>(count - 1) * (size - options.patch_size);
++      if (size <= options.patch_size || benefit <= 0) continue;
++      all_groups.push_back(&group);
++    }
++  }
++  std::sort(all_groups.begin(), all_groups.end(),
++            [&](const IdenticalGroup* x, const IdenticalGroup* y) {
++              return BlockOrderLess(blocks[x->members.front()],
++                                    blocks[y->members.front()]);
++            });
++
++  // Emit directives and tally stats.
++  uint64_t master_id = options.first_master_id;
++  for (const IdenticalGroup* group : all_groups) {
++    const int count = static_cast<int>(group->members.size());
++    const int size = static_cast<int>(blocks[group->members.front()].bytes.size());
++
++    const TailCallBlock& master = blocks[group->members.front()];
++    result.directives.push_back(Directive{DirectiveKind::kMaster,
++                                          master.module_name,
++                                          master.function_name, master.bb_id,
++                                          master_id});
++    for (size_t i = 1; i < group->members.size(); ++i) {
++      const TailCallBlock& fold = blocks[group->members[i]];
++      result.directives.push_back(Directive{DirectiveKind::kFold,
++                                            fold.module_name,
++                                            fold.function_name, fold.bb_id,
++                                            master_id});
++    }
++
++    ++result.num_groups;
++    ++result.num_masters;
++    result.num_folds += count - 1;
++    result.bytes_saved += static_cast<int64_t>(count - 1) * (size - options.patch_size);
++    ++master_id;
++  }
++
++  std::sort(result.directives.begin(), result.directives.end(),
++            DirectiveOrderLess);
++  return result;
++}
++
++std::string FormatDirectives(const TailCallDedupResult& result) {
++  std::string out;
++  const std::string* cur_module = nullptr;
++  const std::string* cur_function = nullptr;
++  for (const Directive& d : result.directives) {
++    if (cur_module == nullptr || *cur_module != d.module_name) {
++      out += "m ";
++      out += d.module_name;
++      out += "\n";
++      cur_module = &d.module_name;
++      cur_function = nullptr;  // force re-emitting the function header
++    }
++    if (cur_function == nullptr || *cur_function != d.function_name) {
++      out += "f ";
++      out += d.function_name;
++      out += "\n";
++      cur_function = &d.function_name;
++    }
++    out += (d.kind == DirectiveKind::kMaster) ? "bbm " : "bbf ";
++    out += std::to_string(d.bb_id);
++    out += " (DeduBB.master.";
++    out += std::to_string(d.master_id);
++    out += ")\n";
++  }
++  return out;
++}
++
++}  // namespace propeller
+diff --git a/propeller/tail_call_dedupper.h b/propeller/tail_call_dedupper.h
+new file mode 100644
+index 0000000..fcd6c07
+--- /dev/null
++++ b/propeller/tail_call_dedupper.h
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef PROPELLER_TAIL_CALL_DEDUPPER_H_
++#define PROPELLER_TAIL_CALL_DEDUPPER_H_
++
++// DeduBB tail-call basic-block deduplication core (LCTES'26).
++//
++// This is the dependency-free heart of "Step 1": given the candidate basic
++// blocks that end in a tail call or a return, it identifies byte-identical
++// duplicates with the FNV-1a hash (a fast O(1) average filter) followed by a
++// byte-by-byte verification (to rule out hash collisions), then folds the
++// duplicates that yield a net size reduction. The result is a list of
++// directives in the `bbm`/`bbf` form consumed by the LLVM CodeGen side.
++//
++// The matching is intentionally *literal byte equality*: two blocks are folded
++// only when their machine bytes are identical. This is always safe -- a folded
++// block ending in a tail call or return is replaced by a single jump to the
++// master copy, and jumping (rather than calling) preserves the current stack
++// frame, so executing the master's tail/return transfers control exactly as the
++// original block would have. Position-dependent encodings (e.g. a tail `jmp`
++// with a PC-relative displacement that differs by location) simply will not
++// match, so no unsafe fold is ever emitted.
++//
++// This header deliberately depends only on the C++ standard library so the
++// algorithm can be unit-tested and demonstrated in isolation, without pulling in
++// LLVM/abseil/protobuf. The binary-facing glue lives in
++// `tail_call_profile_writer.h`.
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace propeller {
++
++// 64-bit FNV-1a hash (Fowler-Noll-Vo, Noll). Used as the fast bucket key before
++// the byte-by-byte verification.
++uint64_t Fnv1aHash(const uint8_t* data, size_t size);
++uint64_t Fnv1aHash(const std::vector<uint8_t>& bytes);
++
++// A basic block that is a candidate for tail-call deduplication, i.e. it ends
++// with a tail call or a return so it can be folded with a single jump to a
++// master copy.
++struct TailCallBlock {
++  std::string module_name;     // Source module ("" if unknown).
++  std::string function_name;   // Function symbol the block belongs to.
++  uint32_t bb_id = 0;          // BB id within the function (matches BBAddrMap).
++  uint64_t address = 0;        // Binary address (used for deterministic order).
++  uint64_t frequency = 0;      // Execution frequency (used for master selection).
++  std::vector<uint8_t> bytes;  // Raw machine bytes of the block.
++};
++
++// Kind of an emitted directive: `bbm` (master copy) or `bbf` (fold to master).
++enum class DirectiveKind { kMaster, kFold };
++
++// One emitted directive line. A group of identical blocks produces exactly one
++// `kMaster` directive (the retained copy, labelled `DeduBB.master.<master_id>`)
++// and one `kFold` directive per duplicate (replaced by a jump to the master).
++struct Directive {
++  DirectiveKind kind = DirectiveKind::kFold;
++  std::string module_name;
++  std::string function_name;
++  uint32_t bb_id = 0;
++  uint64_t master_id = 0;  // K in `DeduBB.master.K`; shared across the group.
++};
++
++struct TailCallDedupOptions {
++  // Bytes needed to patch a folded block with a single jump to the master.
++  // x86-64 `jmp rel32` is 5 bytes; AArch64 `b` is 4 bytes.
++  int patch_size = 5;
++  // Minimum number of identical copies in a group before folding is considered.
++  int min_occurrences = 2;
++  // First value of K used for `DeduBB.master.K` symbol names. Any unique
++  // numbering works; the CodeGen side only relies on master/fold lines of the
++  // same group sharing the same K.
++  uint64_t first_master_id = 0;
++  // If true, only deduplicate blocks that belong to the same module.
++  bool intra_module_only = false;
++};
++
++struct TailCallDedupResult {
++  // Directives to emit, in deterministic order (by module, function, bb id).
++  std::vector<Directive> directives;
++  int num_groups = 0;       // Number of master groups (folded).
++  int num_masters = 0;      // Number of `bbm` directives (== num_groups).
++  int num_folds = 0;        // Number of `bbf` directives.
++  int64_t bytes_saved = 0;  // Estimated `.text` reduction in bytes.
++};
++
++// Runs the DeduBB tail-call dedup algorithm over `blocks`:
++//   1. bucket blocks by FNV-1a hash of their bytes,
++//   2. within a bucket, group blocks with *identical* bytes (byte-by-byte),
++//   3. fold each group whose size benefit `(count-1) * (size - patch_size)` is
++//      positive, promoting the first block (in address order) to the master.
++// The input is not mutated; ordering of the output is deterministic.
++TailCallDedupResult DeduplicateTailCallBlocks(
++    const std::vector<TailCallBlock>& blocks,
++    const TailCallDedupOptions& options = {});
++
++// Formats `result` as the textual directive file consumed by the LLVM CodeGen
++// side:
++//
++//   m <module>
++//   f <function>
++//   bbm <id> (DeduBB.master.<K>)
++//   bbf <id> (DeduBB.master.<K>)
++//
++// `m`/`f` headers are emitted whenever the module/function changes.
++std::string FormatDirectives(const TailCallDedupResult& result);
++
++}  // namespace propeller
++
++#endif  // PROPELLER_TAIL_CALL_DEDUPPER_H_
+diff --git a/propeller/tail_call_dedupper_test.cc b/propeller/tail_call_dedupper_test.cc
+new file mode 100644
+index 0000000..31e46de
+--- /dev/null
++++ b/propeller/tail_call_dedupper_test.cc
+@@ -0,0 +1,159 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "propeller/tail_call_dedupper.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "gtest/gtest.h"
++
++namespace propeller {
++namespace {
++
++// x86-64 epilogue: add $0x18,%rsp; pop %rbx; pop %rbp; ret  (7 bytes, > 5-byte
++// jmp patch, so folding saves space).
++const std::vector<uint8_t> kEpilogueA = {0x48, 0x83, 0xc4, 0x18,
++                                         0x5b, 0x5d, 0xc3};
++// A different 7-byte epilogue: add $0x28,%rsp; pop %rbx; pop %rbp; ret.
++const std::vector<uint8_t> kEpilogueB = {0x48, 0x83, 0xc4, 0x28,
++                                         0x5b, 0x5d, 0xc3};
++// pop %rbp; ret  (2 bytes, <= 5-byte patch, never worth folding on x86).
++const std::vector<uint8_t> kTinyEpilogue = {0x5d, 0xc3};
++
++TailCallBlock MakeBlock(std::string module, std::string function, uint32_t id,
++                        uint64_t address, std::vector<uint8_t> bytes) {
++  return TailCallBlock{std::move(module), std::move(function), id, address,
++                       std::move(bytes)};
++}
++
++// Locks the FNV-1a constants against well-known reference vectors.
++TEST(Fnv1aHashTest, MatchesKnownVectors) {
++  EXPECT_EQ(Fnv1aHash(std::vector<uint8_t>{}), 0xcbf29ce484222325ULL);
++  EXPECT_EQ(Fnv1aHash(std::vector<uint8_t>{'a'}), 0xaf63dc4c8601ec8cULL);
++  EXPECT_EQ(Fnv1aHash(std::vector<uint8_t>{'f', 'o', 'o', 'b', 'a', 'r'}),
++            0x85944171f73967e8ULL);
++}
++
++TEST(Fnv1aHashTest, IdenticalBytesHashEqualDifferentBytesDiffer) {
++  EXPECT_EQ(Fnv1aHash(kEpilogueA), Fnv1aHash(kEpilogueA));
++  EXPECT_NE(Fnv1aHash(kEpilogueA), Fnv1aHash(kEpilogueB));
++}
++
++// Two functions with an identical epilogue -> one master, one fold.
++TEST(DeduplicateTailCallBlocksTest, FoldsIdenticalEpilogueAcrossFunctions) {
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("bar.cpp", "bar", /*id=*/3, /*address=*/0x1000, kEpilogueA),
++      MakeBlock("foo.cpp", "foo", /*id=*/5, /*address=*/0x2000, kEpilogueA),
++  };
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks);
++
++  EXPECT_EQ(result.num_groups, 1);
++  EXPECT_EQ(result.num_masters, 1);
++  EXPECT_EQ(result.num_folds, 1);
++  // (count-1) * (size - patch) = 1 * (7 - 5) = 2 bytes saved.
++  EXPECT_EQ(result.bytes_saved, 2);
++
++  ASSERT_EQ(result.directives.size(), 2u);
++  // Master is the lowest-address block (bar, 0x1000).
++  const Directive& master = result.directives[0];
++  EXPECT_EQ(master.kind, DirectiveKind::kMaster);
++  EXPECT_EQ(master.function_name, "bar");
++  EXPECT_EQ(master.bb_id, 3u);
++  const Directive& fold = result.directives[1];
++  EXPECT_EQ(fold.kind, DirectiveKind::kFold);
++  EXPECT_EQ(fold.function_name, "foo");
++  EXPECT_EQ(fold.bb_id, 5u);
++  // Master and fold reference the same master id (K).
++  EXPECT_EQ(master.master_id, fold.master_id);
++}
++
++// Three identical copies -> one master + two folds.
++TEST(DeduplicateTailCallBlocksTest, FoldsThreeWay) {
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("a.cpp", "a", 1, 0x1000, kEpilogueA),
++      MakeBlock("b.cpp", "b", 1, 0x2000, kEpilogueA),
++      MakeBlock("c.cpp", "c", 1, 0x3000, kEpilogueA),
++  };
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks);
++  EXPECT_EQ(result.num_groups, 1);
++  EXPECT_EQ(result.num_folds, 2);
++  EXPECT_EQ(result.bytes_saved, 2 * (7 - 5));
++}
++
++// Distinct byte sequences are never folded together, even if grouped.
++TEST(DeduplicateTailCallBlocksTest, DoesNotFoldDifferentBytes) {
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("a.cpp", "a", 1, 0x1000, kEpilogueA),
++      MakeBlock("b.cpp", "b", 1, 0x2000, kEpilogueB),
++  };
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks);
++  EXPECT_EQ(result.num_groups, 0);
++  EXPECT_TRUE(result.directives.empty());
++}
++
++// Blocks whose size does not exceed the jump patch are not folded.
++TEST(DeduplicateTailCallBlocksTest, DoesNotFoldWhenNoSizeBenefit) {
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("a.cpp", "a", 1, 0x1000, kTinyEpilogue),
++      MakeBlock("b.cpp", "b", 1, 0x2000, kTinyEpilogue),
++  };
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks);
++  EXPECT_EQ(result.num_groups, 0);
++}
++
++// A singleton block (no duplicate) is left untouched.
++TEST(DeduplicateTailCallBlocksTest, DoesNotFoldSingleton) {
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("a.cpp", "a", 1, 0x1000, kEpilogueA),
++  };
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks);
++  EXPECT_EQ(result.num_groups, 0);
++}
++
++// The emitted text matches the directive format from the paper (Fig. 10).
++TEST(FormatDirectivesTest, MatchesPaperFormat) {
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("bar.cpp", "bar", /*id=*/0, /*address=*/0x1190, kEpilogueA),
++      MakeBlock("foo.cpp", "foo", /*id=*/2, /*address=*/0x2000, kEpilogueA),
++  };
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks);
++  EXPECT_EQ(FormatDirectives(result),
++            "m bar.cpp\n"
++            "f bar\n"
++            "bbm 0 (DeduBB.master.0)\n"
++            "m foo.cpp\n"
++            "f foo\n"
++            "bbf 2 (DeduBB.master.0)\n");
++}
++
++// AArch64 uses a 4-byte branch patch; an 8-byte epilogue still folds.
++TEST(DeduplicateTailCallBlocksTest, HonorsArmPatchSize) {
++  // ldp x29, x30, [sp], #32 ; ret  (8 bytes).
++  const std::vector<uint8_t> kArmEpilogue = {0xfd, 0x7b, 0xc2, 0xa8,
++                                             0xc0, 0x03, 0x5f, 0xd6};
++  std::vector<TailCallBlock> blocks = {
++      MakeBlock("a.cpp", "a", 1, 0x1000, kArmEpilogue),
++      MakeBlock("b.cpp", "b", 1, 0x2000, kArmEpilogue),
++  };
++  TailCallDedupOptions options;
++  options.patch_size = 4;  // AArch64 `b`.
++  TailCallDedupResult result = DeduplicateTailCallBlocks(blocks, options);
++  EXPECT_EQ(result.num_folds, 1);
++  EXPECT_EQ(result.bytes_saved, 8 - 4);
++}
++
++}  // namespace
++}  // namespace propeller
+diff --git a/propeller/tail_call_profile_writer.cc b/propeller/tail_call_profile_writer.cc
+new file mode 100644
+index 0000000..a42fec4
+--- /dev/null
++++ b/propeller/tail_call_profile_writer.cc
+@@ -0,0 +1,168 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "propeller/tail_call_profile_writer.h"
++
++#include <cstdint>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "absl/log/log.h"
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/str_format.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/Object/ObjectFile.h"
++#include "llvm/TargetParser/Triple.h"
++#include "propeller/bb_addr_map.h"
++#include "propeller/bb_addr_map.pb.h"
++#include "propeller/binary_content.h"
++#include "propeller/propeller_options.pb.h"
++#include "propeller/status_macros.h"  // Included for macros.
++#include "propeller/tail_call_dedupper.h"
++
++namespace propeller {
++namespace {
++
++// Slices `size` raw bytes at binary address `addr` out of the text section that
++// contains it. Mirrors the section lookup used by `MiniDisassembler`.
++absl::StatusOr<std::vector<uint8_t>> GetBlockBytes(
++    const llvm::object::ObjectFile& object_file, uint64_t addr, uint64_t size) {
++  for (const llvm::object::SectionRef& section : object_file.sections()) {
++    if (!section.isText() || section.isVirtual()) continue;
++    const uint64_t section_addr = section.getAddress();
++    const uint64_t section_size = section.getSize();
++    if (addr < section_addr || addr + size > section_addr + section_size)
++      continue;
++    llvm::Expected<llvm::StringRef> content = section.getContents();
++    if (!content) {
++      return absl::FailedPreconditionError("section has no content");
++    }
++    const uint64_t offset = addr - section_addr;
++    const uint8_t* data =
++        reinterpret_cast<const uint8_t*>(content->data()) + offset;
++    return std::vector<uint8_t>(data, data + size);
++  }
++  return absl::NotFoundError(
++      absl::StrFormat("no text section contains address 0x%lx", addr));
++}
++
++}  // namespace
++
++int TailCallPatchSize(const BinaryContent& binary_content) {
++  switch (llvm::Triple::ArchType(binary_content.object_file->getArch())) {
++    case llvm::Triple::x86:
++    case llvm::Triple::x86_64:
++      return 5;  // `jmp rel32`
++    case llvm::Triple::aarch64:
++    case llvm::Triple::aarch64_be:
++    case llvm::Triple::arm:
++    case llvm::Triple::armeb:
++    case llvm::Triple::thumb:
++    case llvm::Triple::thumbeb:
++      return 4;  // `b`
++    default:
++      return 5;
++  }
++}
++
++std::vector<TailCallBlock> BuildTailCallBlocks(
++    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
++    bool cold_only) {
++  std::vector<TailCallBlock> blocks;
++  for (const ModuleBbAddrMapPb& module : bb_addr_map.module_bb_addr_maps()) {
++    for (const FunctionBbAddrMapPb& function :
++         module.function_bb_addr_maps()) {
++      const std::string function_name =
++          function.function_names().empty()
++              ? std::string(absl::StrFormat("0x%lx", function.function_address()))
++              : std::string(function.function_names(0));
++      for (const BbRangePb& bb_range : function.bb_ranges()) {
++        for (const BbEntryPb& bb_entry : bb_range.bb_entries()) {
++          // Only blocks that end in a tail call or a return are foldable with a
++          // single jump (DeduBB Case I).
++          if (!bb_entry.has_tail_call() && !bb_entry.has_return()) continue;
++          if (bb_entry.size() == 0) continue;
++          // Exception-handling pads have special unwinder requirements; leave
++          // them alone.
++          if (bb_entry.is_eh_pad()) continue;
++          // Optionally restrict to cold blocks to preserve hot-path
++          // performance (DeduBB profile-guided mode).
++          if (cold_only && (bb_entry.post_link_frequency() > 0 || bb_entry.frequency() > 0)) continue;
++
++          const uint64_t address = bb_range.base_address() + bb_entry.offset();
++          absl::StatusOr<std::vector<uint8_t>> bytes = GetBlockBytes(
++              *binary_content.object_file, address, bb_entry.size());
++          if (!bytes.ok()) {
++            LOG(WARNING) << "Skipping block " << function_name << "#"
++                         << bb_entry.id() << ": " << bytes.status().message();
++            continue;
++          }
++          std::string mod_name = std::string(module.module_name());
++          if (mod_name.empty()) {
++            size_t uniq_pos = function_name.find(".__uniq.");
++            if (uniq_pos != std::string::npos) {
++              mod_name = function_name.substr(uniq_pos + 8);
++            }
++          }
++          blocks.push_back(TailCallBlock{mod_name, function_name,
++                                         bb_entry.id(), address,
++                                         std::max(static_cast<uint64_t>(bb_entry.post_link_frequency()), static_cast<uint64_t>(bb_entry.frequency())),
++                                         *std::move(bytes)});
++        }
++      }
++    }
++  }
++  return blocks;
++}
++
++absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts) {
++  if (opts.tail_call_profile_out_name().empty()) return absl::OkStatus();
++
++  ASSIGN_OR_RETURN(std::unique_ptr<BinaryContent> binary_content,
++                   GetBinaryContent(opts.binary_name()));
++
++  // `GetBbAddrMap` decodes the `SHT_LLVM_BB_ADDR_MAP` section into a proto with
++  // module names (via DWARF), function names (via the symbol table), and the
++  // per-block tail-call/return flags we need.
++  const BbAddrMapPb bb_addr_map = GetBbAddrMap(opts.binary_name());
++
++  std::vector<TailCallBlock> blocks = BuildTailCallBlocks(
++      bb_addr_map, *binary_content, opts.tail_call_dedup_cold_only());
++
++  TailCallDedupOptions dedup_options;
++  dedup_options.patch_size = TailCallPatchSize(*binary_content);
++  dedup_options.intra_module_only = opts.tail_call_dedup_intra_module_only();
++  const TailCallDedupResult result =
++      DeduplicateTailCallBlocks(blocks, dedup_options);
++
++  const std::string out_path(opts.tail_call_profile_out_name());
++  std::ofstream out(out_path, std::ofstream::out | std::ofstream::trunc);
++  out << FormatDirectives(result);
++  if (!out) {
++    return absl::UnavailableError(
++        absl::StrFormat("Failed to write DeduBB directives to '%s'", out_path));
++  }
++
++  LOG(INFO) << "DeduBB tail-call dedup: " << blocks.size()
++            << " candidate blocks, " << result.num_groups << " master group(s), "
++            << result.num_folds << " fold(s), ~" << result.bytes_saved
++            << " bytes saved; wrote " << opts.tail_call_profile_out_name();
++  return absl::OkStatus();
++}
++
++}  // namespace propeller
+diff --git a/propeller/tail_call_profile_writer.h b/propeller/tail_call_profile_writer.h
+new file mode 100644
+index 0000000..46fb10f
+--- /dev/null
++++ b/propeller/tail_call_profile_writer.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
++#define PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
++
++// Binary-facing glue for DeduBB tail-call deduplication ("Step 1").
++//
++// `WriteTailCallDedupProfile` reads the basic blocks of `opts.binary_name()`
++// from its `SHT_LLVM_BB_ADDR_MAP` section, extracts the raw machine bytes of
++// each block that ends in a tail call or return, runs the FNV-1a + byte-by-byte
++// deduplication (see `tail_call_dedupper.h`), and writes the resulting
++// `m`/`f`/`bbm`/`bbf` directives to `opts.tail_call_profile_out_name()`.
++//
++// This is a static analysis of the binary: it does not require a perf profile.
++// A profile is only consulted when `opts.tail_call_dedup_cold_only()` is set, to
++// restrict folding to cold blocks.
++
++#include <vector>
++
++#include "absl/status/status.h"
++#include "propeller/bb_addr_map.pb.h"
++#include "propeller/binary_content.h"
++#include "propeller/propeller_options.pb.h"
++#include "propeller/tail_call_dedupper.h"
++
++namespace propeller {
++
++// Builds the deduplication candidate blocks (those ending in a tail call or
++// return) from a decoded `BbAddrMapPb`, slicing their raw bytes out of
++// `binary_content`. Exposed for testing. If `cold_only` is true, blocks with a
++// non-zero post-link frequency are skipped.
++std::vector<TailCallBlock> BuildTailCallBlocks(
++    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
++    bool cold_only);
++
++// Returns the size in bytes of the jump used to patch a folded block on the
++// binary's architecture (x86: 5, AArch64/ARM: 4).
++int TailCallPatchSize(const BinaryContent& binary_content);
++
++// Runs DeduBB tail-call deduplication on `opts.binary_name()` and writes the
++// directive file to `opts.tail_call_profile_out_name()`. A no-op (returns OK) if
++// `tail_call_profile_out_name` is empty.
++absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts);
++
++}  // namespace propeller
++
++#endif  // PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
