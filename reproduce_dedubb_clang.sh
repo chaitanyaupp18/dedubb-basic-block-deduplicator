@@ -28,7 +28,7 @@ mkdir -p ${PATH_TO_LLVM_SOURCES} && cd ${PATH_TO_LLVM_SOURCES}
 if [ ! -d "llvm-project" ]; then
     git clone https://github.com/llvm/llvm-project.git
     cd llvm-project
-    git reset --hard acbd822
+    git reset --hard 333edde4e
     git apply ${CWD}/llvm-project-dedubb.patch
 else
     cd llvm-project
