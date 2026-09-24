@@ -58,7 +58,7 @@ Run the offline Propeller analysis tool on the generated binary. Propeller will 
 
 ```bash
 ./llvm-propeller/build/propeller/generate_propeller_profiles \
-    --binary=test_no_lto_labels \
+    --binary=test_lto_labels \
     --tail_call_profile=dedubb_directives.txt
 ```
 *(You should see an output indicating: `1 master group(s), 1 fold(s)`)*
