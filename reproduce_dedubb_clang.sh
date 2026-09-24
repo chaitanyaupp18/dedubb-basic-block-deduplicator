@@ -29,7 +29,7 @@ if [ ! -d "llvm-project" ]; then
     git clone https://github.com/llvm/llvm-project.git
     cd llvm-project
     git reset --hard 333edde4e
-    git apply ${CWD}/llvm-project-dedubb.patch
+    git apply ${CWD}/patches/llvm-project-dedubb.patch
 else
     cd llvm-project
 fi
@@ -40,7 +40,7 @@ if [ ! -d "propeller" ]; then
     git clone https://github.com/google/llvm-propeller.git propeller
     cd propeller
     git reset --hard e2c7049
-    git apply ${CWD}/llvm-propeller-dedubb.patch
+    git apply ${CWD}/patches/llvm-propeller-dedubb.patch
 else
     cd propeller
 fi
