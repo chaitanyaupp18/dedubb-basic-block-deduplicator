@@ -101,9 +101,9 @@ ninja clang
 
 # 8. Measure Sizes
 printf "Baseline BBAddrMap Stats\n" > ${BASE_DIR}/Results/sizes_clang_dedup.txt
-ls -l ${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} | awk '{print $5}' >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
+${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size ${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
 
 printf "\nDeduBB Optimized Stats\n" >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
-ls -l ${PATH_TO_OPTIMIZED_DEDUBB_BUILD}/bin/clang-${CLANG_VERSION} | awk '{print $5}' >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
+${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size ${PATH_TO_OPTIMIZED_DEDUBB_BUILD}/bin/clang-${CLANG_VERSION} >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
 
 cat ${BASE_DIR}/Results/sizes_clang_dedup.txt
